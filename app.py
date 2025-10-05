@@ -12,10 +12,11 @@ from shapely.ops import unary_union
 from PIL import Image
 from pyproj import Transformer
 import pandas as pd
+from datetime import datetime
 import matplotlib
 
 matplotlib.use("Agg")
-from matplotlib import cm, colors
+from matplotlib import colors
 
 st.set_page_config(page_title="JolChobi — Sunamganj Flood Visualizer", layout="wide")
 st.title("JolChobi 🌊 — Sunamganj Flood Visualizer")
@@ -30,6 +31,15 @@ st.markdown(
 )
 
 st.divider()
+
+if "forecast_summary" not in st.session_state:
+    st.session_state["forecast_summary"] = None
+if "forecast_error" not in st.session_state:
+    st.session_state["forecast_error"] = ""
+if "forecast_requested" not in st.session_state:
+    st.session_state["forecast_requested"] = False
+if "forecast_inflight" not in st.session_state:
+    st.session_state["forecast_inflight"] = False
 
 with st.sidebar:
     st.header("Controls")
@@ -47,9 +57,10 @@ with st.sidebar:
     preset = st.selectbox(
         "Presets (Surma gauge)",
         ["Custom","Surma: Warning +0.5 m","Surma: Warning +1.0 m","Surma: Severe +1.5 m","Surma: Extreme +2.0 m"],
-        index=1
+        index=1,
+        key="preset_select"
     )
-    custom_level = st.slider("Custom water level above river (m)", 0.0, 6.0, 1.0, 0.1)
+    custom_level = st.slider("Custom water level above river (m)", 0.0, 6.0, 1.0, 0.1, key="custom_level_slider")
     st.caption("Presets follow local warning thresholds. Adjust the slider for bespoke what-if analysis.")
 
     st.subheader("Live layers (optional)")
@@ -64,6 +75,12 @@ with st.sidebar:
     st.caption("DEM powers the elevation model; Overpass pulls the latest OSM roads, health facilities, and cyclone shelters.")
 
     export = st.button("Export GeoTIFF + PNG")
+
+    st.subheader("Forecast assist")
+    st.caption("Pull a 7-day rainfall and wind outlook to suggest a next-week water level scenario.")
+    if st.button("Fetch 7-day outlook", use_container_width=True, key="fetch_forecast"):
+        st.session_state["forecast_requested"] = True
+        st.session_state["forecast_error"] = ""
 
 def overpass(query:str, endpoint:str)->dict:
     r = requests.post(endpoint, data={"data": query}, timeout=90)
@@ -167,6 +184,69 @@ def osm_roads(endpoint, bbox):
     return gdf
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_weekly_forecast(lat: float, lon: float) -> dict:
+    """Fetch 7-day forecast from the Open-Meteo API."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": ",".join([
+            "precipitation_sum",
+            "windspeed_10m_max",
+            "temperature_2m_max"
+        ]),
+        "timezone": "UTC",
+        "forecast_days": 7
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def summarize_forecast(forecast: dict) -> dict:
+    daily = forecast.get("daily", {})
+    dates = daily.get("time", [])
+    rain = daily.get("precipitation_sum", [])
+    wind = daily.get("windspeed_10m_max", [])
+    temp = daily.get("temperature_2m_max", [])
+    if not dates:
+        raise ValueError("Forecast did not include daily outlook data")
+
+    df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(dates),
+            "Rain (mm)": rain,
+            "Wind max (km/h)": wind,
+            "Temp max (°C)": temp
+        }
+    )
+    df["Date"] = df["Date"].dt.strftime("%a %d %b")
+
+    rain_vals = pd.to_numeric(df["Rain (mm)"], errors="coerce").to_numpy(dtype="float32")
+    wind_vals = pd.to_numeric(df["Wind max (km/h)"], errors="coerce").to_numpy(dtype="float32")
+    temp_vals = pd.to_numeric(df["Temp max (°C)"], errors="coerce").to_numpy(dtype="float32")
+
+    valid_rain = rain_vals[np.isfinite(rain_vals)]
+    valid_wind = wind_vals[np.isfinite(wind_vals)]
+    valid_temp = temp_vals[np.isfinite(temp_vals)]
+
+    total_rain = float(valid_rain.sum()) if valid_rain.size else 0.0
+    peak_wind = float(valid_wind.max()) if valid_wind.size else 0.0
+    mean_temp = float(valid_temp.mean()) if valid_temp.size else 0.0
+
+    suggested_extra = float(np.clip(total_rain / 200.0 + peak_wind / 150.0, 0.0, 6.0))
+
+    return {
+        "dataframe": df,
+        "total_rain": total_rain,
+        "peak_wind": peak_wind,
+        "mean_temp": mean_temp,
+        "suggested_extra": round(suggested_extra, 2),
+        "issued_at": datetime.utcnow()
+    }
+
+
 # Inundation
 river_elev = np.nanpercentile(dem, 15)
 if preset == "Custom":
@@ -208,6 +288,23 @@ if np.any(mask):
 
 # Map
 center_lat, center_lon = (s+n)/2, (w+e)/2
+
+if st.session_state.get("forecast_requested") and not st.session_state.get("forecast_inflight"):
+    try:
+        st.session_state["forecast_inflight"] = True
+        raw_forecast = fetch_weekly_forecast(center_lat, center_lon)
+        st.session_state["forecast_summary"] = summarize_forecast(raw_forecast)
+        st.session_state["forecast_error"] = ""
+    except Exception as exc:
+        st.session_state["forecast_summary"] = None
+        st.session_state["forecast_error"] = str(exc)
+    finally:
+        st.session_state["forecast_requested"] = False
+        st.session_state["forecast_inflight"] = False
+
+forecast_summary = st.session_state.get("forecast_summary")
+forecast_error = st.session_state.get("forecast_error", "")
+
 m = folium.Map(location=[center_lat, center_lon], zoom_start=9, control_scale=True, tiles="OpenStreetMap")
 
 if add_rain:
@@ -241,11 +338,20 @@ ImageOverlay(name="Elevation (DEM)", image="dem_overlay.png", bounds=[[s,w],[n,e
 
 # Flood overlay with depth-based gradient
 max_depth = float(depth[mask].max()) if np.any(mask) else 0.0
-palette_ceiling = 6.0  # align with control slider range for consistent comparisons
+palette_ceiling = max(max_depth, 1e-3)
 norm = colors.Normalize(vmin=0.0, vmax=palette_ceiling, clip=True)
 normalized_depth = norm(depth)
 
-cmap = cm.get_cmap("RdYlGn_r")  # green (shallow) → yellow → red (deep)
+cmap = colors.LinearSegmentedColormap.from_list(
+    "shallow_to_deep_red",
+    [
+        (0.0, "#fde0dd"),  # very light rose for shallow areas
+        (0.4, "#fa9fb5"),
+        (0.7, "#f768a1"),
+        (0.9, "#dd3497"),
+        (1.0, "#7a0177")   # deep magenta-red for intense flooding
+    ]
+)  # light → deep red gradient
 rgba = cmap(normalized_depth)
 alpha = np.where(mask, np.clip(0.25 + 0.6 * normalized_depth, 0.0, 1.0), 0.0)
 rgba[..., 3] = alpha
@@ -255,6 +361,24 @@ flood_rgba = (rgba * 255).astype("uint8")
 
 Image.fromarray(flood_rgba, mode="RGBA").save("flood_overlay.png")
 ImageOverlay(name="Inundation", image="flood_overlay.png", bounds=[[s,w],[n,e]], opacity=0.8).add_to(m)
+
+with st.sidebar:
+    st.subheader("Forecast insight")
+    if st.session_state.get("forecast_inflight"):
+        st.info("Fetching forecast outlook…")
+    elif forecast_error:
+        st.warning(f"Forecast unavailable: {forecast_error}")
+    elif forecast_summary:
+        st.metric("Suggested extra water level", f"{forecast_summary['suggested_extra']:.2f} m")
+        st.caption(
+            f"Based on next 7-day totals: {forecast_summary['total_rain']:.0f} mm rain, "
+            f"peak wind {forecast_summary['peak_wind']:.0f} km/h, average max temp {forecast_summary['mean_temp']:.1f} °C."
+        )
+        if st.button("Apply suggested level", use_container_width=True, key="apply_forecast"):
+            st.session_state["custom_level_slider"] = float(np.clip(forecast_summary['suggested_extra'], 0.0, 6.0))
+            st.session_state["preset_select"] = "Custom"
+            st.success("Forecast suggestion applied to custom level.")
+            st.experimental_rerun()
 
 # Live OSM layers
 with st.spinner("Refreshing live OpenStreetMap layers…"):
@@ -309,9 +433,10 @@ lat_mid = (s+n)/2
 pix_area = pixel_area_km2(dem_transform, dem_crs, lat_mid)
 flood_km2 = float(np.sum(flood==1) * pix_area)
 
-tab_map, tab_impacts, tab_methods = st.tabs([
+tab_map, tab_impacts, tab_forecast, tab_methods = st.tabs([
     "Interactive map",
     "Exposure summary",
+    "Next-week outlook",
     "How the model works"
 ])
 
@@ -323,7 +448,7 @@ with tab_map:
         st.markdown(
             """
             - **Elevation (DEM)** — greyscale hillshade derived from the uploaded GeoTIFF.
-            - **Inundation depth** — shades shift from soft green (shallow) to vivid red (deep) as the modeled water thickens.
+            - **Inundation depth** — pale pink tiles mark shallow water and intensify to deep magenta where the model predicts the highest depths.
             - **Live radar & WMS** — optional remote tiles so you can cross-check the model with observations.
             - **OSM features** — roads (dark grey), health facilities (green markers), and cyclone shelters (red markers).
             """
@@ -353,10 +478,35 @@ with tab_impacts:
 
         The river base elevation is approximated from the 15th percentile of the DEM (≈ {river_elev:.2f} m). Pixels are
         flagged as inundated when they fall below the target water surface of {target_level:.2f} m. Colors transition from
-        soft green through amber into red as depth increases (scaled on a 0-6 m palette), with red zones representing the
-        deepest water (≈ {max_depth:.2f} m).
+        soft blush into deep magenta as depth increases, with the darkest tiles representing the deepest water detectable in this
+        scenario (≈ {max_depth:.2f} m).
         """
+        + (
+            f"\n\nForecast outlook suggests adding ≈ {forecast_summary['suggested_extra']:.2f} m "
+            f"(rain {forecast_summary['total_rain']:.0f} mm, peak wind {forecast_summary['peak_wind']:.0f} km/h)."
+            if forecast_summary
+            else ""
+        )
     )
+
+with tab_forecast:
+    st.markdown("#### 7-day meteorological outlook")
+    if forecast_summary:
+        df = forecast_summary["dataframe"]
+        st.dataframe(df, use_container_width=True)
+        rain_chart = df.set_index("Date")["Rain (mm)"]
+        if rain_chart.sum() > 0:
+            st.bar_chart(rain_chart, height=200)
+        st.markdown(
+            f"Total rain **{forecast_summary['total_rain']:.0f} mm**, peak wind **{forecast_summary['peak_wind']:.0f} km/h**, "
+            f"mean max temp **{forecast_summary['mean_temp']:.1f} °C**. Suggestion heuristic: rain/200 + wind/150 "
+            f"→ **{forecast_summary['suggested_extra']:.2f} m** extra water level."
+        )
+        st.caption("Source: Open-Meteo API (refreshed hourly; cached locally for one hour).")
+    elif forecast_error:
+        st.warning("Forecast data not available yet. Try fetching the 7-day outlook from the sidebar.")
+    else:
+        st.info("Fetch the 7-day outlook from the sidebar to populate this tab with rainfall and wind projections.")
 
 with tab_methods:
     st.markdown("#### Modeling Cheatsheet")
