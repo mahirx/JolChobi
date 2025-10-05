@@ -11,14 +11,33 @@ from shapely.geometry import shape, mapping, Point, Polygon
 from shapely.ops import unary_union
 from PIL import Image
 from pyproj import Transformer
+import pandas as pd
 
 st.set_page_config(page_title="JolChobi — Sunamganj Flood Visualizer", layout="wide")
 st.title("JolChobi 🌊 — Sunamganj Flood Visualizer")
 st.caption("Live OSM overlays + fast flood modeling for responders. (Hackathon MVP)")
 
+st.markdown(
+    """
+    This interactive dashboard blends live OpenStreetMap context layers with rapid flood modeling so response teams can
+    explore what happens when the Surma river rises. Use the controls on the left to adjust the scenario and compare
+    how assets are impacted.
+    """
+)
+
+st.divider()
+
 with st.sidebar:
     st.header("Controls")
+    st.markdown(
+        """
+        Tune the scenario to understand how different modeling assumptions change the inundation footprint. Hover the
+        ⓘ icons in the tabs for more context.
+        """
+    )
+
     method = st.selectbox("Method", ["Bathtub (fast)", "HAND (approx)"], index=0)
+    st.caption("Bathtub quickly floods any pixel below the target level; HAND approximates real-world connectivity to channels.")
 
     st.subheader("Water level")
     preset = st.selectbox(
@@ -27,15 +46,18 @@ with st.sidebar:
         index=1
     )
     custom_level = st.slider("Custom water level above river (m)", 0.0, 6.0, 1.0, 0.1)
+    st.caption("Presets follow local warning thresholds. Adjust the slider for bespoke what-if analysis.")
 
     st.subheader("Live layers (optional)")
     add_rain = st.checkbox("Add live radar (RainViewer tiles)")
     wms_url = st.text_input("WMS endpoint (optional)", "")
     wms_layer = st.text_input("WMS Layer name (optional)", "")
+    st.caption("Add agency feeds or radar overlays to compare modeled water against observations.")
 
     st.subheader("Data")
     dem_path = st.text_input("DEM (GeoTIFF)", "data/dem_sunamganj.tif")
     overpass_endpoint = st.text_input("Overpass API", "https://overpass-api.de/api/interpreter")
+    st.caption("DEM powers the elevation model; Overpass pulls the latest OSM roads, health facilities, and cyclone shelters.")
 
     export = st.button("Export GeoTIFF + PNG")
 
@@ -211,10 +233,10 @@ Image.fromarray(flood_rgba, mode="RGBA").save("flood_overlay.png")
 ImageOverlay(name="Inundation", image="flood_overlay.png", bounds=[[s,w],[n,e]], opacity=0.8).add_to(m)
 
 # Live OSM layers
-st.info("Fetching live OSM layers…")
-roads = osm_roads(overpass_endpoint, sunam_bbox)
-health = osm_points(overpass_endpoint, sunam_bbox, what="health")
-shelters = osm_points(overpass_endpoint, sunam_bbox, what="cyclone_shelter")
+with st.spinner("Refreshing live OpenStreetMap layers…"):
+    roads = osm_roads(overpass_endpoint, sunam_bbox)
+    health = osm_points(overpass_endpoint, sunam_bbox, what="health")
+    shelters = osm_points(overpass_endpoint, sunam_bbox, what="cyclone_shelter")
 
 if not roads.empty:
     folium.GeoJson(roads.to_json(), name="Roads", style_function=lambda x: {"color":"#444","weight":1}).add_to(m)
@@ -233,7 +255,7 @@ if not shelters.empty:
 
 MousePosition().add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
-st.components.v1.html(m._repr_html_(), height=700)
+map_html = m._repr_html_()
 
 # Impacts
 Tinv = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
@@ -263,12 +285,77 @@ lat_mid = (s+n)/2
 pix_area = pixel_area_km2(dem_transform, dem_crs, lat_mid)
 flood_km2 = float(np.sum(flood==1) * pix_area)
 
-st.markdown("### Summary")
-st.write(f"- Method: **{method}**")
-st.write(f"- Water level above river (m): **{level:.2f}** (preset: **{preset}**)")
-st.write(f"- Estimated flooded area: **{flood_km2:.2f} km²**")
-st.write(f"- Health posts in flooded zone: **{health_in}**")
-st.write(f"- Cyclone shelters in flooded zone: **{shelter_in}**")
+tab_map, tab_impacts, tab_methods = st.tabs([
+    "Interactive map",
+    "Exposure summary",
+    "How the model works"
+])
+
+with tab_map:
+    st.markdown("#### Interactive Flood Map")
+    st.caption("Pan, zoom, and toggle layers to compare modeled inundation with live context feeds.")
+    st.components.v1.html(map_html, height=700)
+    with st.expander("Layer legend & tips", expanded=False):
+        st.markdown(
+            """
+            - **Elevation (DEM)** — greyscale hillshade derived from the uploaded GeoTIFF.
+            - **Inundation** — semi-transparent blue overlay for pixels that flood under the selected scenario.
+            - **Live radar & WMS** — optional remote tiles so you can cross-check the model with observations.
+            - **OSM features** — roads (dark grey), health facilities (green markers), and cyclone shelters (red markers).
+            """
+        )
+
+with tab_impacts:
+    st.markdown("#### Scenario Snapshot")
+    metrics = st.columns(3, gap="large")
+    metrics[0].metric("Flooded area", f"{flood_km2:.2f} km²")
+    metrics[1].metric("Health sites at risk", int(health_in))
+    metrics[2].metric("Cyclone shelters affected", int(shelter_in))
+
+    snapshot_df = pd.DataFrame(
+        [
+            {"Category": "Health facilities", "Assets in flood": int(health_in)},
+            {"Category": "Cyclone shelters", "Assets in flood": int(shelter_in)}
+        ]
+    )
+    if snapshot_df["Assets in flood"].sum() > 0:
+        st.bar_chart(snapshot_df.set_index("Category"))
+    else:
+        st.info("No mapped health facilities or cyclone shelters intersect the flooded area for this scenario.")
+
+    st.markdown(
+        f"""
+        **Method**: `{method}` · **Preset**: `{preset}` · **Extra water above river**: `{level:.2f} m`
+
+        The river base elevation is approximated from the 15th percentile of the DEM (≈ {river_elev:.2f} m). Pixels are
+        flagged as inundated when they fall below the target water surface of {target_level:.2f} m.
+        """
+    )
+
+with tab_methods:
+    st.markdown("#### Modeling Cheatsheet")
+    st.markdown(
+        """
+        **Bathtub (fast)**
+        : Fills every cell below the target level. Great for quick situational awareness.
+
+        **HAND (approx)**
+        : Uses a Height Above Nearest Drainage surface (approximated here with a fast distance-to-river proxy) to keep the
+        flood connected to channels. Useful when you need to avoid isolated pits.
+
+        **OSM live layers**
+        : Each rerun fetches the latest features from Overpass so classifications and names stay fresh.
+
+        **Custom overlays**
+        : Add a WMS endpoint (e.g., national flood forecasts) or the RainViewer radar tiles to validate the extent visually.
+        """
+    )
+    st.markdown(
+        """
+        The export button on the left packages the inundation mask as a GeoTIFF (aligned to your DEM) plus the RGBA PNG for
+        briefing decks. Use these downloads to bring the scenario into QGIS or to share quick situational updates.
+        """
+    )
 
 if export:
     # GeoTIFF export (same georef as DEM)
