@@ -130,8 +130,8 @@ streamlit run app.py
 - *“We support **live OSM**, **radar tiles**, and any **WMS**—plus one-click GeoTIFF/PNG exports for WhatsApp and field ops.”*
 - *“Roadmap: plug-in to **BWDB Surma gauge**, higher-fidelity **HAND** from drainage networks, **SMS alerts**, and **offline bundles** for union parishads.”*
 
-##WMS endpoint:
+## WMS endpoint:
 - https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi
 
-##Layer name:
+## Layer name:
 - MODIS_Terra_CorrectedReflectance_TrueColor
