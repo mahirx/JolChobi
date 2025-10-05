@@ -9,3 +9,4 @@ pyproj
 Pillow
 scipy
 requests
+matplotlib

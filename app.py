@@ -12,6 +12,10 @@ from shapely.ops import unary_union
 from PIL import Image
 from pyproj import Transformer
 import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+from matplotlib import cm, colors
 
 st.set_page_config(page_title="JolChobi — Sunamganj Flood Visualizer", layout="wide")
 st.title("JolChobi 🌊 — Sunamganj Flood Visualizer")
@@ -189,9 +193,18 @@ def quick_hand(dem, transform):
 
 if method.startswith("Bathtub"):
     flood = (dem <= target_level).astype("uint8")
+    surface_delta = np.maximum(target_level - dem, 0)
+    surface_delta = np.where(np.isfinite(surface_delta), surface_delta, 0)
 else:
     hand = quick_hand(dem, dem_transform)
     flood = (hand <= level).astype("uint8")
+    surface_delta = np.maximum(level - hand, 0)
+    surface_delta = np.where(np.isfinite(surface_delta), surface_delta, 0)
+
+depth = np.zeros_like(surface_delta, dtype="float32")
+mask = flood == 1
+if np.any(mask):
+    depth[mask] = surface_delta[mask]
 
 # Map
 center_lat, center_lon = (s+n)/2, (w+e)/2
@@ -226,9 +239,20 @@ dem_rgba = np.dstack([dem_img, dem_img, dem_img, np.where(np.isfinite(dem), 120,
 Image.fromarray(dem_rgba, mode="RGBA").save("dem_overlay.png")
 ImageOverlay(name="Elevation (DEM)", image="dem_overlay.png", bounds=[[s,w],[n,e]], opacity=0.5).add_to(m)
 
-# Flood overlay
-flood_rgba = np.zeros((flood.shape[0], flood.shape[1], 4), dtype="uint8")
-flood_rgba[flood==1] = np.array([43,131,186,160], dtype="uint8")
+# Flood overlay with depth-based gradient
+max_depth = float(depth[mask].max()) if np.any(mask) else 0.0
+palette_ceiling = 6.0  # align with control slider range for consistent comparisons
+norm = colors.Normalize(vmin=0.0, vmax=palette_ceiling, clip=True)
+normalized_depth = norm(depth)
+
+cmap = cm.get_cmap("RdYlGn_r")  # green (shallow) → yellow → red (deep)
+rgba = cmap(normalized_depth)
+alpha = np.where(mask, np.clip(0.25 + 0.6 * normalized_depth, 0.0, 1.0), 0.0)
+rgba[..., 3] = alpha
+
+rgba[..., :3] = np.where(mask[..., None], rgba[..., :3], 0.0)
+flood_rgba = (rgba * 255).astype("uint8")
+
 Image.fromarray(flood_rgba, mode="RGBA").save("flood_overlay.png")
 ImageOverlay(name="Inundation", image="flood_overlay.png", bounds=[[s,w],[n,e]], opacity=0.8).add_to(m)
 
@@ -299,7 +323,7 @@ with tab_map:
         st.markdown(
             """
             - **Elevation (DEM)** — greyscale hillshade derived from the uploaded GeoTIFF.
-            - **Inundation** — semi-transparent blue overlay for pixels that flood under the selected scenario.
+            - **Inundation depth** — shades shift from soft green (shallow) to vivid red (deep) as the modeled water thickens.
             - **Live radar & WMS** — optional remote tiles so you can cross-check the model with observations.
             - **OSM features** — roads (dark grey), health facilities (green markers), and cyclone shelters (red markers).
             """
@@ -328,7 +352,9 @@ with tab_impacts:
         **Method**: `{method}` · **Preset**: `{preset}` · **Extra water above river**: `{level:.2f} m`
 
         The river base elevation is approximated from the 15th percentile of the DEM (≈ {river_elev:.2f} m). Pixels are
-        flagged as inundated when they fall below the target water surface of {target_level:.2f} m.
+        flagged as inundated when they fall below the target water surface of {target_level:.2f} m. Colors transition from
+        soft green through amber into red as depth increases (scaled on a 0-6 m palette), with red zones representing the
+        deepest water (≈ {max_depth:.2f} m).
         """
     )
 
