@@ -1,8 +1,8 @@
-import os, io, json, requests, math, numpy as np
+import os, io, json, requests, math, textwrap, numpy as np
 import streamlit as st
 import folium
 from folium.raster_layers import ImageOverlay, WmsTileLayer, TileLayer
-from folium.plugins import MousePosition
+from folium.plugins import MousePosition, MiniMap, Fullscreen
 import rasterio
 from rasterio import features
 from rasterio.warp import transform_bounds
@@ -10,10 +10,11 @@ import geopandas as gpd
 from shapely.geometry import shape, mapping, Point, Polygon
 from shapely.ops import unary_union
 from PIL import Image
-from pyproj import Transformer
+from pyproj import Transformer, Proj
 import pandas as pd
 from datetime import datetime
 import matplotlib
+from branca.colormap import LinearColormap
 
 matplotlib.use("Agg")
 from matplotlib import colors
@@ -40,6 +41,22 @@ if "forecast_requested" not in st.session_state:
     st.session_state["forecast_requested"] = False
 if "forecast_inflight" not in st.session_state:
     st.session_state["forecast_inflight"] = False
+if "hydrology_summary" not in st.session_state:
+    st.session_state["hydrology_summary"] = None
+if "precip_summary" not in st.session_state:
+    st.session_state["precip_summary"] = None
+if "llm_recommendation" not in st.session_state:
+    st.session_state["llm_recommendation"] = None
+if "llm_error" not in st.session_state:
+    st.session_state["llm_error"] = ""
+if "hydrology_error" not in st.session_state:
+    st.session_state["hydrology_error"] = ""
+if "precip_error" not in st.session_state:
+    st.session_state["precip_error"] = ""
+if "waterlevel_recommendation" not in st.session_state:
+    st.session_state["waterlevel_recommendation"] = None
+if "llm_inflight" not in st.session_state:
+    st.session_state["llm_inflight"] = False
 
 with st.sidebar:
     st.header("Controls")
@@ -77,10 +94,56 @@ with st.sidebar:
     export = st.button("Export GeoTIFF + PNG")
 
     st.subheader("Forecast assist")
-    st.caption("Pull a 7-day rainfall and wind outlook to suggest a next-week water level scenario.")
+    st.caption("Pull the latest rainfall, river discharge, and optional GPT narrative to tune next-week water levels.")
     if st.button("Fetch 7-day outlook", use_container_width=True, key="fetch_forecast"):
         st.session_state["forecast_requested"] = True
         st.session_state["forecast_error"] = ""
+        st.session_state["hydrology_error"] = ""
+        st.session_state["precip_error"] = ""
+
+    llm_api_key = st.text_input(
+        "LLM API key (OpenAI, optional)",
+        value="",
+        type="password",
+        key="llm_api_key_input",
+        help="Stored only for this session. Provide if you want a GPT-based narrative for the scenario.",
+    )
+    llm_model = st.selectbox(
+        "LLM model",
+        ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"],
+        index=0,
+        key="llm_model_select",
+    )
+    if st.button("Ask LLM for scenario note", use_container_width=True, key="call_llm"):
+        recommendation = st.session_state.get("waterlevel_recommendation")
+        if not recommendation:
+            st.warning("Fetch forecast data first so the LLM has quantitative context.")
+        elif not llm_api_key:
+            st.warning("Add an API key before requesting guidance.")
+        else:
+            st.session_state["llm_inflight"] = True
+            st.session_state["llm_error"] = ""
+            try:
+                level = st.session_state.get("latest_target_level")
+                if isinstance(level, (int, float)) and not math.isnan(level):
+                    target_val = float(level)
+                else:
+                    target_val = float(recommendation["suggested_extra"])
+                message = request_llm_guidance(
+                    api_key=llm_api_key,
+                    model=llm_model,
+                    recommendation=recommendation,
+                    forecast_summary=st.session_state.get("forecast_summary"),
+                    hydrology_summary=st.session_state.get("hydrology_summary"),
+                    precip_summary=st.session_state.get("precip_summary"),
+                    target_level=target_val,
+                )
+                st.session_state["llm_recommendation"] = message
+            except Exception as exc:
+                st.session_state["llm_error"] = str(exc)
+                st.session_state["llm_recommendation"] = None
+            finally:
+                st.session_state["llm_inflight"] = False
 
 def overpass(query:str, endpoint:str)->dict:
     r = requests.post(endpoint, data={"data": query}, timeout=90)
@@ -183,6 +246,28 @@ def osm_roads(endpoint, bbox):
     gdf = gpd.GeoDataFrame(feats, geometry=geoms, crs="EPSG:4326")
     return gdf
 
+def calculate_flooded_roads_km(roads_gdf, flood_mask, dem_transform, dem_crs):
+    """Calculates the approximate length of flooded roads."""
+    if roads_gdf.empty:
+        return 0.0
+
+    # Project roads to the DEM's CRS for accurate intersection
+    roads_proj = roads_gdf.to_crs(dem_crs)
+
+    # Create a polygon of the flooded area
+    shapes = features.shapes(flood_mask, mask=(flood_mask == 1), transform=dem_transform)
+    flood_polygons = [shape(geom) for geom, val in shapes if val == 1]
+    if not flood_polygons:
+        return 0.0
+    
+    flood_geom = unary_union(flood_polygons)
+
+    # Find intersection and calculate length
+    flooded_roads_geom = roads_proj.geometry.intersection(flood_geom)
+    flooded_roads_gdf = gpd.GeoDataFrame(geometry=flooded_roads_geom, crs=dem_crs)
+    
+    # Length is in meters, convert to km
+    return flooded_roads_gdf.length.sum() / 1000.0
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_weekly_forecast(lat: float, lon: float) -> dict:
@@ -198,6 +283,40 @@ def fetch_weekly_forecast(lat: float, lon: float) -> dict:
         ]),
         "timezone": "UTC",
         "forecast_days": 7
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_hourly_precipitation(lat: float, lon: float) -> dict:
+    """Retrieve the last 48h + next 72h hourly precipitation totals."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "precipitation,rain",
+        "past_days": 2,
+        "forecast_days": 3,
+        "timezone": "UTC"
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_hydrology_forecast(lat: float, lon: float) -> dict:
+    """Pull daily river discharge projections from the Open-Meteo Flood API."""
+    url = "https://flood-api.open-meteo.com/v1/flood"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "river_discharge,river_discharge_min,river_discharge_max,river_discharge_mean",
+        "past_days": 3,
+        "forecast_days": 10,
+        "timezone": "UTC"
     }
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
@@ -247,8 +366,232 @@ def summarize_forecast(forecast: dict) -> dict:
     }
 
 
+def summarize_precip(hourly: dict) -> dict:
+    data = hourly.get("hourly", {})
+    times = pd.to_datetime(data.get("time", []))
+    precip = pd.to_numeric(data.get("precipitation", []), errors="coerce")
+    if times.empty:
+        raise ValueError("Hourly precipitation feed returned no timestamps")
+
+    df = pd.DataFrame({"Timestamp": times, "Precipitation (mm)": precip})
+    df["Local Timestamp"] = df["Timestamp"].dt.tz_localize("UTC")
+
+    cutoff_recent = datetime.utcnow() - pd.Timedelta(hours=48)
+    recent = df[df["Timestamp"] >= cutoff_recent]
+    upcoming = df[df["Timestamp"] > datetime.utcnow()]
+
+    recent_total = float(recent["Precipitation (mm)"].sum())
+    next_day = float(
+        upcoming[upcoming["Timestamp"] <= datetime.utcnow() + pd.Timedelta(hours=24)]["Precipitation (mm)"].sum()
+    )
+
+    peak_hour = float(upcoming["Precipitation (mm)"].max()) if not upcoming.empty else 0.0
+
+    return {
+        "dataframe": df,
+        "recent_total": round(recent_total, 1),
+        "next_day_total": round(next_day, 1),
+        "peak_hour": round(peak_hour, 2),
+    }
+
+
+def summarize_hydrology(hydrology: dict) -> dict:
+    daily = hydrology.get("daily", {})
+    dates = pd.to_datetime(daily.get("time", []))
+    if dates.empty:
+        raise ValueError("Flood API returned no discharge timeline")
+
+    discharge = pd.to_numeric(daily.get("river_discharge", []), errors="coerce")
+    discharge_min = pd.to_numeric(daily.get("river_discharge_min", []), errors="coerce")
+    discharge_max = pd.to_numeric(daily.get("river_discharge_max", []), errors="coerce")
+    discharge_mean = pd.to_numeric(daily.get("river_discharge_mean", []), errors="coerce")
+
+    df = pd.DataFrame(
+        {
+            "Date": dates,
+            "Discharge (m³/s)": discharge,
+            "Discharge min (m³/s)": discharge_min,
+            "Discharge max (m³/s)": discharge_max,
+            "Discharge mean (m³/s)": discharge_mean,
+        }
+    ).dropna(subset=["Date"])
+    df["Date"] = df["Date"].dt.tz_localize("UTC")
+
+    current_discharge = float(df.iloc[0]["Discharge (m³/s)"]) if not df.empty else 0.0
+    top_forecast = float(df["Discharge max (m³/s)"].iloc[:10].max()) if not df.empty else 0.0
+
+    trend_window = df.iloc[:7]
+    trend_delta = 0.0
+    if len(trend_window) >= 2:
+        trend_delta = float(trend_window["Discharge mean (m³/s)"].iloc[-1] - trend_window["Discharge mean (m³/s)"].iloc[0])
+
+    return {
+        "dataframe": df,
+        "current_discharge": round(current_discharge, 2),
+        "peak_discharge": round(top_forecast, 2),
+        "trend_delta": round(trend_delta, 2),
+    }
+
+
+def build_waterlevel_recommendation(
+    forecast_summary: dict | None,
+    hydrology_summary: dict | None,
+    precip_summary: dict | None,
+) -> dict | None:
+    if not any([forecast_summary, hydrology_summary, precip_summary]):
+        return None
+
+    components = []
+    total = 0.0
+
+    if forecast_summary:
+        rain_factor = forecast_summary["total_rain"] / 180.0
+        wind_factor = forecast_summary["peak_wind"] / 200.0
+        total += rain_factor + wind_factor
+        components.append(
+            {
+                "label": "7-day rainfall",
+                "value": round(rain_factor, 2),
+                "context": f"{forecast_summary['total_rain']:.0f} mm total rain",
+            }
+        )
+        components.append(
+            {
+                "label": "Peak wind",
+                "value": round(wind_factor, 2),
+                "context": f"{forecast_summary['peak_wind']:.0f} km/h gusts",
+            }
+        )
+
+    if precip_summary:
+        near_term = precip_summary["next_day_total"] / 120.0
+        burst = np.clip(precip_summary["peak_hour"] / 30.0, 0.0, 1.2)
+        total += near_term + burst
+        components.append(
+            {
+                "label": "Next 24h rain",
+                "value": round(near_term, 2),
+                "context": f"{precip_summary['next_day_total']:.1f} mm expected",
+            }
+        )
+        components.append(
+            {
+                "label": "Peak hourly rain",
+                "value": round(burst, 2),
+                "context": f"{precip_summary['peak_hour']:.2f} mm/h burst",
+            }
+        )
+
+    if hydrology_summary:
+        discharge_growth = 0.0
+        if hydrology_summary["current_discharge"] > 0:
+            discharge_growth = (
+                hydrology_summary["peak_discharge"] - hydrology_summary["current_discharge"]
+            ) / max(hydrology_summary["current_discharge"], 1.0)
+        discharge_growth = np.clip(discharge_growth, -0.5, 4.0)
+        trend_factor = hydrology_summary["trend_delta"] / 10.0
+        total += discharge_growth + trend_factor
+        components.append(
+            {
+                "label": "Peak discharge vs today",
+                "value": round(discharge_growth, 2),
+                "context": (
+                    f"{hydrology_summary['current_discharge']:.1f}→{hydrology_summary['peak_discharge']:.1f} m³/s"
+                ),
+            }
+        )
+        components.append(
+            {
+                "label": "Weekly discharge trend",
+                "value": round(trend_factor, 2),
+                "context": f"Δ {hydrology_summary['trend_delta']:+.2f} m³/s over 1 week",
+            }
+        )
+
+    suggested = float(np.clip(total, 0.0, 6.0))
+    return {
+        "suggested_extra": round(suggested, 2),
+        "components": components,
+        "generated_at": datetime.utcnow(),
+    }
+
+
+def request_llm_guidance(
+    api_key: str,
+    model: str,
+    recommendation: dict | None,
+    forecast_summary: dict | None,
+    hydrology_summary: dict | None,
+    precip_summary: dict | None,
+    target_level: float,
+) -> str:
+    if not api_key:
+        raise ValueError("Provide an API key to request LLM guidance.")
+
+    bullet_lines = []
+    if recommendation:
+        for comp in recommendation.get("components", []):
+            bullet_lines.append(f"- {comp['label']}: +{comp['value']:.2f} m ({comp['context']})")
+
+    drivers_block = bullet_lines or ["- No quantitative drivers available."]
+    summary_lines = [
+        f"Target flood water surface: {target_level:.2f} m",
+        f"Recommended extra depth: {recommendation['suggested_extra']:.2f} m" if recommendation else "Recommendation pending.",
+        "Drivers:",
+        *drivers_block,
+    ]
+
+    extra_context = {
+        "forecast": forecast_summary or {},
+        "hydrology": hydrology_summary or {},
+        "precipitation": precip_summary or {},
+    }
+
+    prompt = textwrap.dedent(
+        f"""
+        You are advising rapid flood response teams for Sunamganj, Bangladesh.
+        Using the quantitative inputs below, draft a concise paragraph (<=120 words)
+        with actionable interpretation of the recommended flood stage increase and how
+        recent rainfall and discharge outlooks influence that choice. Always mention
+        notable risks if river discharge is surging or if extreme rain is imminent.
+
+        Summary:
+        {'\\n'.join(summary_lines)}
+
+        Raw metrics (JSON):
+        {json.dumps(extra_context, default=str)}
+        """
+    ).strip()
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a hydrologist supporting disaster responders."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 280,
+    }
+
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=45
+    )
+    response.raise_for_status()
+    data = response.json()
+    choices = data.get("choices")
+    if not choices:
+        raise RuntimeError("LLM response did not include any choices.")
+    return choices[0]["message"]["content"].strip()
+
+
 # Inundation
-river_elev = np.nanpercentile(dem, 15)
+river_mask = dem <= np.nanpercentile(dem, 5)
+river_elev = np.nanmean(dem[river_mask])
+
 if preset == "Custom":
     level = custom_level
 elif preset == "Surma: Warning +0.5 m":
@@ -260,6 +603,7 @@ elif preset == "Surma: Severe +1.5 m":
 else:
     level = 2.0
 target_level = river_elev + level
+st.session_state["latest_target_level"] = float(target_level)
 
 def quick_hand(dem, transform):
     low = dem <= np.nanpercentile(dem, 10)
@@ -292,20 +636,51 @@ center_lat, center_lon = (s+n)/2, (w+e)/2
 if st.session_state.get("forecast_requested") and not st.session_state.get("forecast_inflight"):
     try:
         st.session_state["forecast_inflight"] = True
-        raw_forecast = fetch_weekly_forecast(center_lat, center_lon)
-        st.session_state["forecast_summary"] = summarize_forecast(raw_forecast)
-        st.session_state["forecast_error"] = ""
-    except Exception as exc:
-        st.session_state["forecast_summary"] = None
-        st.session_state["forecast_error"] = str(exc)
+        try:
+            raw_forecast = fetch_weekly_forecast(center_lat, center_lon)
+            st.session_state["forecast_summary"] = summarize_forecast(raw_forecast)
+            st.session_state["forecast_error"] = ""
+        except Exception as exc:
+            st.session_state["forecast_summary"] = None
+            st.session_state["forecast_error"] = str(exc)
+
+        try:
+            raw_precip = fetch_hourly_precipitation(center_lat, center_lon)
+            st.session_state["precip_summary"] = summarize_precip(raw_precip)
+            st.session_state["precip_error"] = ""
+        except Exception as exc:
+            st.session_state["precip_summary"] = None
+            st.session_state["precip_error"] = str(exc)
+
+        try:
+            raw_hydrology = fetch_hydrology_forecast(center_lat, center_lon)
+            st.session_state["hydrology_summary"] = summarize_hydrology(raw_hydrology)
+            st.session_state["hydrology_error"] = ""
+        except Exception as exc:
+            st.session_state["hydrology_summary"] = None
+            st.session_state["hydrology_error"] = str(exc)
     finally:
+        st.session_state["waterlevel_recommendation"] = build_waterlevel_recommendation(
+            st.session_state.get("forecast_summary"),
+            st.session_state.get("hydrology_summary"),
+            st.session_state.get("precip_summary"),
+        )
         st.session_state["forecast_requested"] = False
         st.session_state["forecast_inflight"] = False
 
 forecast_summary = st.session_state.get("forecast_summary")
 forecast_error = st.session_state.get("forecast_error", "")
+precip_summary = st.session_state.get("precip_summary")
+precip_error = st.session_state.get("precip_error", "")
+hydrology_summary = st.session_state.get("hydrology_summary")
+hydrology_error = st.session_state.get("hydrology_error", "")
+recommendation = st.session_state.get("waterlevel_recommendation")
+llm_recommendation = st.session_state.get("llm_recommendation")
+llm_error = st.session_state.get("llm_error", "")
 
 m = folium.Map(location=[center_lat, center_lon], zoom_start=9, control_scale=True, tiles="OpenStreetMap")
+MiniMap(toggle_display=True, position="bottomleft").add_to(m)
+Fullscreen(position="topright").add_to(m)
 
 if add_rain:
     TileLayer(
@@ -344,14 +719,14 @@ normalized_depth = norm(depth)
 
 cmap = colors.LinearSegmentedColormap.from_list(
     "shallow_to_deep_red",
-    [
-        (0.0, "#fde0dd"),  # very light rose for shallow areas
-        (0.4, "#fa9fb5"),
-        (0.7, "#f768a1"),
-        (0.9, "#dd3497"),
-        (1.0, "#7a0177")   # deep magenta-red for intense flooding
+     [
+        (0.0, "#e0f3f8"),  # very light blue
+        (0.25, "#abd9e9"),
+        (0.5, "#74add1"),
+        (0.75, "#4575b4"),
+        (1.0, "#313695")   # deep indigo
     ]
-)  # light → deep red gradient
+)
 rgba = cmap(normalized_depth)
 alpha = np.where(mask, np.clip(0.25 + 0.6 * normalized_depth, 0.0, 1.0), 0.0)
 rgba[..., 3] = alpha
@@ -361,6 +736,15 @@ flood_rgba = (rgba * 255).astype("uint8")
 
 Image.fromarray(flood_rgba, mode="RGBA").save("flood_overlay.png")
 ImageOverlay(name="Inundation", image="flood_overlay.png", bounds=[[s,w],[n,e]], opacity=0.8).add_to(m)
+if palette_ceiling > 0:
+    legend_max = max(palette_ceiling, 0.5)
+    color_scale = LinearColormap(
+        ["#e0f3f8", "#abd9e9", "#74add1", "#4575b4", "#313695"],
+        vmin=0,
+        vmax=legend_max,
+        caption="Flood depth (m)",
+    )
+    color_scale.add_to(m)
 
 with st.sidebar:
     st.subheader("Forecast insight")
@@ -368,17 +752,55 @@ with st.sidebar:
         st.info("Fetching forecast outlook…")
     elif forecast_error:
         st.warning(f"Forecast unavailable: {forecast_error}")
-    elif forecast_summary:
-        st.metric("Suggested extra water level", f"{forecast_summary['suggested_extra']:.2f} m")
-        st.caption(
-            f"Based on next 7-day totals: {forecast_summary['total_rain']:.0f} mm rain, "
-            f"peak wind {forecast_summary['peak_wind']:.0f} km/h, average max temp {forecast_summary['mean_temp']:.1f} °C."
-        )
-        if st.button("Apply suggested level", use_container_width=True, key="apply_forecast"):
-            st.session_state["custom_level_slider"] = float(np.clip(forecast_summary['suggested_extra'], 0.0, 6.0))
-            st.session_state["preset_select"] = "Custom"
-            st.success("Forecast suggestion applied to custom level.")
-            st.experimental_rerun()
+    elif any([forecast_summary, hydrology_summary, precip_summary]):
+        recommendation = st.session_state.get("waterlevel_recommendation")
+        if recommendation:
+            st.metric(
+                "Recommended extra water level",
+                f"{recommendation['suggested_extra']:.2f} m",
+                help="Combined from rainfall, winds, hourly rain bursts, and river discharge outlook.",
+            )
+            drivers = "\n".join(
+                f"- {comp['label']}: {comp['value']:+.2f} m ({comp['context']})"
+                for comp in recommendation["components"]
+                if abs(comp["value"]) >= 0.05
+            )
+            if drivers:
+                st.markdown(drivers)
+            if st.button("Apply recommended level", use_container_width=True, key="apply_forecast"):
+                st.session_state["custom_level_slider"] = float(
+                    np.clip(recommendation["suggested_extra"], 0.0, 6.0)
+                )
+                st.session_state["preset_select"] = "Custom"
+                st.success("Recommendation applied to custom level.")
+                st.experimental_rerun()
+
+        if forecast_summary:
+            st.caption(
+                f"7-day totals: {forecast_summary['total_rain']:.0f} mm rain · "
+                f"peak wind {forecast_summary['peak_wind']:.0f} km/h · "
+                f"average max temp {forecast_summary['mean_temp']:.1f} °C."
+            )
+        if precip_summary and not precip_error:
+            st.caption(
+                f"Next 24h rain {precip_summary['next_day_total']:.1f} mm · "
+                f"Peak hourly burst {precip_summary['peak_hour']:.2f} mm."
+            )
+        if hydrology_summary and not hydrology_error:
+            st.caption(
+                f"River discharge now {hydrology_summary['current_discharge']:.1f} m³/s, "
+                f"peaking near {hydrology_summary['peak_discharge']:.1f} m³/s (Δ {hydrology_summary['trend_delta']:+.2f})."
+            )
+        if hydrology_error:
+            st.warning(f"Hydrology feed issue: {hydrology_error}")
+        if precip_error:
+            st.warning(f"Hourly rain feed issue: {precip_error}")
+        if st.session_state.get("llm_inflight"):
+            st.info("Generating LLM scenario note…")
+        elif llm_error:
+            st.warning(f"LLM guidance failed: {llm_error}")
+        elif llm_recommendation:
+            st.success("LLM scenario note ready in the outlook tab.")
 
 # Live OSM layers
 with st.spinner("Refreshing live OpenStreetMap layers…"):
@@ -433,6 +855,11 @@ lat_mid = (s+n)/2
 pix_area = pixel_area_km2(dem_transform, dem_crs, lat_mid)
 flood_km2 = float(np.sum(flood==1) * pix_area)
 
+# Calculate flooded roads if the GeoDataFrame is available
+flooded_roads_km = 0.0
+if 'roads' in locals() and not roads.empty:
+    flooded_roads_km = calculate_flooded_roads_km(roads, flood, dem_transform, dem_crs)
+
 tab_map, tab_impacts, tab_forecast, tab_methods = st.tabs([
     "Interactive map",
     "Exposure summary",
@@ -448,7 +875,7 @@ with tab_map:
         st.markdown(
             """
             - **Elevation (DEM)** — greyscale hillshade derived from the uploaded GeoTIFF.
-            - **Inundation depth** — pale pink tiles mark shallow water and intensify to deep magenta where the model predicts the highest depths.
+            - **Inundation depth** — pale blue tiles mark shallow water and intensify to deep indigo where the model predicts the highest depths.
             - **Live radar & WMS** — optional remote tiles so you can cross-check the model with observations.
             - **OSM features** — roads (dark grey), health facilities (green markers), and cyclone shelters (red markers).
             """
@@ -456,13 +883,15 @@ with tab_map:
 
 with tab_impacts:
     st.markdown("#### Scenario Snapshot")
-    metrics = st.columns(3, gap="large")
+    metrics = st.columns(4, gap="large")
     metrics[0].metric("Flooded area", f"{flood_km2:.2f} km²")
-    metrics[1].metric("Health sites at risk", int(health_in))
-    metrics[2].metric("Cyclone shelters affected", int(shelter_in))
+    metrics[1].metric("Flooded roads", f"{flooded_roads_km:.1f} km")
+    metrics[2].metric("Health sites at risk", int(health_in))
+    metrics[3].metric("Cyclone shelters affected", int(shelter_in))
 
     snapshot_df = pd.DataFrame(
         [
+            {"Category": "Roads (km)", "Assets in flood": f"{flooded_roads_km:.1f}"},
             {"Category": "Health facilities", "Assets in flood": int(health_in)},
             {"Category": "Cyclone shelters", "Assets in flood": int(shelter_in)}
         ]
@@ -476,15 +905,16 @@ with tab_impacts:
         f"""
         **Method**: `{method}` · **Preset**: `{preset}` · **Extra water above river**: `{level:.2f} m`
 
-        The river base elevation is approximated from the 15th percentile of the DEM (≈ {river_elev:.2f} m). Pixels are
+        The river base elevation is approximated from the average of the lowest 5% of DEM cells (≈ {river_elev:.2f} m). Pixels are
         flagged as inundated when they fall below the target water surface of {target_level:.2f} m. Colors transition from
-        soft blush into deep magenta as depth increases, with the darkest tiles representing the deepest water detectable in this
+        light blue into deep indigo as depth increases, with the darkest tiles representing the deepest water detectable in this
         scenario (≈ {max_depth:.2f} m).
         """
         + (
-            f"\n\nForecast outlook suggests adding ≈ {forecast_summary['suggested_extra']:.2f} m "
-            f"(rain {forecast_summary['total_rain']:.0f} mm, peak wind {forecast_summary['peak_wind']:.0f} km/h)."
-            if forecast_summary
+            "\n\n"
+            + "Combined outlook recommends +"
+            + f"{recommendation['suggested_extra']:.2f} m based on rainfall, hourly bursts, and river discharge."
+            if recommendation
             else ""
         )
     )
@@ -497,16 +927,57 @@ with tab_forecast:
         rain_chart = df.set_index("Date")["Rain (mm)"]
         if rain_chart.sum() > 0:
             st.bar_chart(rain_chart, height=200)
-        st.markdown(
+        narrative = (
             f"Total rain **{forecast_summary['total_rain']:.0f} mm**, peak wind **{forecast_summary['peak_wind']:.0f} km/h**, "
-            f"mean max temp **{forecast_summary['mean_temp']:.1f} °C**. Suggestion heuristic: rain/200 + wind/150 "
-            f"→ **{forecast_summary['suggested_extra']:.2f} m** extra water level."
+            f"mean max temp **{forecast_summary['mean_temp']:.1f} °C**."
         )
+        if recommendation:
+            narrative += (
+                f" Combined driver score recommends **+{recommendation['suggested_extra']:.2f} m** at the gauge."
+            )
+        st.markdown(narrative)
         st.caption("Source: Open-Meteo API (refreshed hourly; cached locally for one hour).")
     elif forecast_error:
         st.warning("Forecast data not available yet. Try fetching the 7-day outlook from the sidebar.")
     else:
         st.info("Fetch the 7-day outlook from the sidebar to populate this tab with rainfall and wind projections.")
+
+    if precip_summary:
+        st.markdown("#### Hourly precipitation (last 48h → next 72h)")
+        precip_cols = st.columns(3)
+        precip_cols[0].metric("Last 48h", f"{precip_summary['recent_total']:.1f} mm")
+        precip_cols[1].metric("Next 24h", f"{precip_summary['next_day_total']:.1f} mm")
+        precip_cols[2].metric("Peak hourly", f"{precip_summary['peak_hour']:.2f} mm/h")
+        precip_df = precip_summary["dataframe"].set_index("Local Timestamp").sort_index()
+        st.area_chart(precip_df["Precipitation (mm)"], height=220)
+        st.caption("Source: Open-Meteo hourly precipitation (UTC timestamps shown).")
+    elif precip_error:
+        st.warning(f"Hourly precipitation timeline unavailable: {precip_error}")
+
+    if hydrology_summary:
+        st.markdown("#### River discharge outlook (GloFAS)")
+        hydro_cols = st.columns(3)
+        hydro_cols[0].metric("Today", f"{hydrology_summary['current_discharge']:.1f} m³/s")
+        hydro_cols[1].metric("Peak (10-day)", f"{hydrology_summary['peak_discharge']:.1f} m³/s")
+        hydro_cols[2].metric("7-day trend", f"{hydrology_summary['trend_delta']:+.2f} m³/s")
+        hydro_df = hydrology_summary["dataframe"].set_index("Date").sort_index()
+        available_cols = [
+            col for col in ["Discharge (m³/s)", "Discharge max (m³/s)", "Discharge min (m³/s)"]
+            if col in hydro_df.columns and hydro_df[col].notna().any()
+        ]
+        if available_cols:
+            st.line_chart(hydro_df[available_cols], height=240)
+        st.caption("Source: Open-Meteo Flood API (driven by Copernicus GloFAS hydrological model).")
+    elif hydrology_error:
+        st.warning(f"River discharge forecast unavailable: {hydrology_error}")
+
+    if llm_recommendation:
+        st.markdown("#### LLM scenario brief")
+        st.info(llm_recommendation)
+    elif llm_error:
+        st.warning(f"LLM scenario note unavailable: {llm_error}")
+    elif st.session_state.get("llm_inflight"):
+        st.info("LLM scenario note is being generated…")
 
 with tab_methods:
     st.markdown("#### Modeling Cheatsheet")
@@ -524,6 +995,12 @@ with tab_methods:
 
         **Custom overlays**
         : Add a WMS endpoint (e.g., national flood forecasts) or the RainViewer radar tiles to validate the extent visually.
+
+        **Hydrology feed**
+        : River discharge scenarios come from the Open-Meteo Flood API (Copernicus GloFAS), highlighting rises that warrant extra depth.
+
+        **LLM narrative (optional)**
+        : Provide an OpenAI API key in the sidebar to generate a short GPT-based briefing that ties the numbers together.
         """
     )
     st.markdown(
