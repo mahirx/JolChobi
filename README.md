@@ -1,25 +1,7 @@
-# JolChobi 🌊 — Sunamganj Flood Visualizer (Enhanced MVP)
+# JolChobi 🌊 — Sunamganj Flood Visualizer (Hackathon MVP)
 
 This repository contains **step-by-step Streamlit apps** that build up to the final JolChobi app.
 You can run each step to verify your environment, then run the final `app.py`.
-
-## 🚀 **NEW: Improved Version Available!**
-
-We've created an **enhanced version** with major improvements:
-- ✅ **Modular architecture** - Clean separation into 6 focused modules
-- ✅ **Better performance** - Cached OSM layers, retry logic for APIs
-- ✅ **Enhanced UX** - DEM upload, basemap selector, opacity controls
-- ✅ **Accurate analytics** - Spatial joins for exposure, fixed area calculations
-- ✅ **Professional exports** - COG format, metadata JSON, in-memory downloads
-- ✅ **Production-ready** - Type hints, tests, pinned dependencies
-
-**Quick start:**
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-See [`IMPROVEMENTS.md`](IMPROVEMENTS.md) for full details and [`MIGRATION_GUIDE.md`](MIGRATION_GUIDE.md) for migration help.
 
 ## Prerequisites
 - **Python 3.10 or 3.11**
@@ -119,8 +101,7 @@ streamlit run step6_exports.py
 
 ## Final App
 ```bash
-streamlit run app.py  # Enhanced version (v2.0)
-# Or run original: streamlit run appv1.py
+streamlit run app.py
 ```
 **Features:**
 - Method: **Bathtub** or **HAND (approx)**
